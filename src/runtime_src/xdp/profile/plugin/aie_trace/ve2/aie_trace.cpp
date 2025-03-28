@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2022-2024 Advanced Micro Devices, Inc. - All rights reserved
+ * Copyright (C) 2022-2025 Advanced Micro Devices, Inc. - All rights reserved
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -97,7 +97,7 @@ namespace xdp {
 
     // Core trace start/end: these are also broadcast to memory module
     coreTraceStartEvent = XAIE_EVENT_ACTIVE_CORE;
-    coreTraceEndEvent = XAIE_EVENT_DISABLED_CORE;
+    coreTraceEndEvent = XAIE_EVENT_USER_EVENT_3_CORE;
 
     // Memory/interface tile trace is flushed at end of run
     memoryTileTraceStartEvent = XAIE_EVENT_TRUE_MEM_TILE;
@@ -292,7 +292,7 @@ namespace xdp {
     }
 
      // Get partition columns
-    boost::property_tree::ptree aiePartitionPt = xdp::aie::getAIEPartitionInfo(handle);
+    boost::property_tree::ptree aiePartitionPt = xdp::aie::getAIEPartitionInfo(handle, false /* handle is not a hwCtxImpl*/);
     // Currently, assuming only one Hw Context is alive at a time
     uint8_t startCol = static_cast<uint8_t>(aiePartitionPt.front().second.get<uint64_t>("start_col"));
     uint8_t numCols  = static_cast<uint8_t>(aiePartitionPt.front().second.get<uint64_t>("num_cols"));
@@ -322,10 +322,11 @@ namespace xdp {
     }
 
     auto compilerOptions = metadataReader->getAIECompilerOptions();
+    uint8_t numRows = metadataReader->getNumRows();
     std::shared_ptr<xaiefal::XAieBroadcast> traceStartBroadcastCh1 = nullptr, traceStartBroadcastCh2 = nullptr;
     if(compilerOptions.enable_multi_layer) {
 
-      aie::trace::timerSyncronization(aieDevInst,aieDevice, metadata, startCol, numCols);
+      aie::trace::timerSyncronization(aieDevInst,aieDevice, metadata, startCol, numCols, numRows);
       if(xrt_core::config::get_aie_trace_settings_trace_start_broadcast()) 
       {
         std::vector<XAie_LocType> vL;
@@ -333,7 +334,9 @@ namespace xdp {
         traceStartBroadcastCh1->reserve();
         traceStartBroadcastCh2 = aieDevice->broadcast(vL, XAIE_PL_MOD, XAIE_CORE_MOD);
         traceStartBroadcastCh2->reserve();
-        aie::trace::build2ChannelBroadcastNetwork(aieDevInst, metadata, traceStartBroadcastCh1->getBc(), traceStartBroadcastCh2->getBc(), XAIE_EVENT_COMBO_EVENT_0_PL, startCol, numCols);
+        aie::trace::build2ChannelBroadcastNetwork(aieDevInst, metadata, traceStartBroadcastCh1->getBc(),
+                                                  traceStartBroadcastCh2->getBc(), XAIE_EVENT_COMBO_EVENT_0_PL,
+                                                  startCol, numCols, numRows);
 
         coreTraceStartEvent = (XAie_Events) (XAIE_EVENT_BROADCAST_0_CORE + traceStartBroadcastCh1->getBc());
         memoryTileTraceStartEvent = (XAie_Events) (XAIE_EVENT_BROADCAST_0_MEM_TILE + traceStartBroadcastCh1->getBc());
@@ -347,7 +350,6 @@ namespace xdp {
     
     if (metadata->getUseUserControl())
       coreTraceStartEvent = XAIE_EVENT_INSTR_EVENT_0_CORE;
-    coreTraceEndEvent = XAIE_EVENT_INSTR_EVENT_1_CORE;
 
     // Iterate over all used/specified tiles
     // NOTE: rows are stored as absolute as required by resource manager
