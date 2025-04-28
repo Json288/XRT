@@ -17,6 +17,8 @@
 #include "adf_runtime_api.h"
 #include "adf_api_message.h"
 
+#include "core/common/error.h"
+
 #include <algorithm>
 #include <sstream>
 #include <map>
@@ -386,7 +388,7 @@ err_code graph_api::update(const rtp_config* pRTPConfig, const void* pValue, siz
     bool relSelLock = true;
     bool relBufLock = true;
 
-    if (config->get_dev()->DevProp.DevGen >= XAIE_DEV_GEN_AIEML) //modification to accommodate AIEML semaphore
+    if (config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIEML || config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIE2PS) //modification to accommodate AIEML semaphore
     {
         if (pRTPConfig->isAsync)
         {
@@ -542,7 +544,7 @@ err_code graph_api::read(const rtp_config* pRTPConfig, void* pValue, size_t numB
     XAie_LocType pingTile = XAie_TileLoc(pRTPConfig->pingColumn, pRTPConfig->pingRow + numReservedRows + 1);
     XAie_LocType pongTile = XAie_TileLoc(pRTPConfig->pongColumn, pRTPConfig->pongRow + numReservedRows + 1);
 
-    if (config->get_dev()->DevProp.DevGen >= XAIE_DEV_GEN_AIEML) //modification to accommodate AIEML semaphore
+    if (config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIEML || config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIE2PS) //modification to accommodate AIEML semaphore
     {
         if (pRTPConfig->isAsync)
             acquireVal = AIE_ML_ASYNC_ACQ;
@@ -649,6 +651,7 @@ err_code gmio_api::configure()
         {
             int bdNum = ((1 - pGMIOConfig->type) * 2 + pGMIOConfig->channelNum) * dmaStartQMaxSize + j;
             availableBDs.push(bdNum);
+            statusBDs[bdNum] = 0;
 
             //set AXI burst length, this won't change during runtime
             driverStatus |= XAie_DmaSetAxi(&shimDmaInst, 0 /*Smid*/, pGMIOConfig->burstLength /*BurstLen*/, 0 /*Qos*/, 0 /*Cache*/, 0 /*Secure*/);
@@ -665,28 +668,36 @@ err_code gmio_api::configure()
     return err_code::ok;
 }
 
-err_code gmio_api::enqueueBD(XAie_MemInst *memInst, uint64_t offset, size_t size)
+void gmio_api::getAvailableBDs()
+{
+    u8 numPendingBDs = 0;
+    int numBDCompleted = 0;
+    int driverStatus = XAIE_OK; //0
+
+    driverStatus |= XAie_DmaGetPendingBdCount(config->get_dev(), gmioTileLoc, pGMIOConfig->channelNum, (pGMIOConfig->type == gmio_config::gm2aie ? DMA_MM2S : DMA_S2MM), &numPendingBDs);
+    if (driverStatus != AieRC::XAIE_OK)
+        throw xrt_core::error(-EIO, "ERROR: adf::gmio_api::getAvailableBDs: AIE driver error.");
+
+    numBDCompleted = dmaStartQMaxSize - numPendingBDs;
+
+    for (int i = 0; i < numBDCompleted && !enqueuedBDs.empty(); i++)
+    {
+        uint16_t bdNumber = frontAndPop(enqueuedBDs);
+        statusBDs[bdNumber]++;
+        availableBDs.push(bdNumber);
+    }
+}
+
+std::pair<size_t, size_t> gmio_api::enqueueBD(XAie_MemInst *memInst, uint64_t offset, size_t size)
 {
     if (!isConfigured)
-        return errorMsg(err_code::internal_error, "ERROR: adf::gmio_api::enqueueBD: GMIO is not configured.");
+        throw xrt_core::error(-ENODEV, "ERROR: adf::gmio_api::enqueueBD: GMIO is not configured.");
 
     int driverStatus = XAIE_OK; //0
 
-    //get available BDs first
-    u8 numPendingBDs = 0;
-    driverStatus |= XAie_DmaGetPendingBdCount(config->get_dev(), gmioTileLoc, pGMIOConfig->channelNum, (pGMIOConfig->type == gmio_config::gm2aie ? DMA_MM2S : DMA_S2MM), &numPendingBDs);
-
-    int numBDCompleted = dmaStartQMaxSize - numPendingBDs;
-    //move completed BDs from enqueuedBDs to availableBDs
-    for (int i = 0; i < numBDCompleted && !enqueuedBDs.empty(); i++)
-    {
-        uint16_t bdNum = frontAndPop(enqueuedBDs);
-        availableBDs.push(bdNum);
-    }
-
-    //first check if we have atleast one availabe BD to proceed
-    if (availableBDs.empty())
-        return errorMsg(err_code::internal_error, "ERROR: adf::gmio_api::enqueueBD: available BDs are empty.");
+    //wait for available BD
+    while (availableBDs.empty())
+        getAvailableBDs();
 
     //get an available BD
     uint16_t bdNumber = frontAndPop(availableBDs);
@@ -694,7 +705,7 @@ err_code gmio_api::enqueueBD(XAie_MemInst *memInst, uint64_t offset, size_t size
     //set up BD
     driverStatus |= XAie_DmaSetAddrOffsetLen(&shimDmaInst, memInst, offset, (u32)size);
 
-    if (config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIEML) // AIEML (note AIE1 XAIE_LOCK_WITH_NO_VALUE is -1, which does not work for AIEML)
+    if (config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIEML || config->get_dev()->DevProp.DevGen == XAIE_DEV_GEN_AIE2PS) // AIEML (note AIE1 XAIE_LOCK_WITH_NO_VALUE is -1, which does not work for AIEML)
         driverStatus |= XAie_DmaSetLock(&shimDmaInst, XAie_LockInit(bdNumber, 0), XAie_LockInit(bdNumber, 0));
     else
         driverStatus |= XAie_DmaSetLock(&shimDmaInst, XAie_LockInit(bdNumber, XAIE_LOCK_WITH_NO_VALUE), XAie_LockInit(bdNumber, XAIE_LOCK_WITH_NO_VALUE));
@@ -702,10 +713,10 @@ err_code gmio_api::enqueueBD(XAie_MemInst *memInst, uint64_t offset, size_t size
     driverStatus |= XAie_DmaEnableBd(&shimDmaInst);
 
     //write BD
-    driverStatus |= XAie_DmaWriteBd_16(config->get_dev(), &shimDmaInst, gmioTileLoc, bdNumber);
+    driverStatus |= XAie_DmaWriteBd(config->get_dev(), &shimDmaInst, gmioTileLoc, bdNumber);
 
     //enqueue BD
-    driverStatus |= XAie_DmaChannelPushBdToQueue_16(config->get_dev(), gmioTileLoc, pGMIOConfig->channelNum, (pGMIOConfig->type == gmio_config::gm2aie ? DMA_MM2S : DMA_S2MM), bdNumber);
+    driverStatus |= XAie_DmaChannelPushBdToQueue(config->get_dev(), gmioTileLoc, pGMIOConfig->channelNum, (pGMIOConfig->type == gmio_config::gm2aie ? DMA_MM2S : DMA_S2MM), bdNumber);
     enqueuedBDs.push(bdNumber);
 
     /* Commenting out as this is increasing overhead of the performance */
@@ -717,9 +728,23 @@ err_code gmio_api::enqueueBD(XAie_MemInst *memInst, uint64_t offset, size_t size
 
     // Update status after using AIE driver
     if (driverStatus != AieRC::XAIE_OK)
-        return errorMsg(err_code::aie_driver_error, "ERROR: adf::gmio_api::enqueueBD: AIE driver error.");
+        throw xrt_core::error(-EIO, "ERROR: adf::gmio_api::enqueueBD: AIE driver error.");
 
-    return err_code::ok;
+    return std::make_pair(bdNumber, statusBDs[bdNumber]);;
+}
+
+bool gmio_api::gmio_status(uint16_t bdNum, uint32_t bdInstance)
+{
+    if (statusBDs.find(bdNum) == statusBDs.end())
+        throw xrt_core::error(-ENODEV, "ERROR: adf::gmio_api::status: Invalid BD.");
+
+    if (statusBDs[bdNum] > bdInstance)
+        return true;
+
+    //update the availableBDs queue
+    getAvailableBDs();
+
+    return statusBDs[bdNum] > bdInstance;
 }
 
 err_code gmio_api::wait()
@@ -825,7 +850,7 @@ err_code dma_api::configureBD(int tileType, uint8_t column, uint8_t row, uint16_
 
     //iteration
     if (bdParam.iteration_stepsize > 0 || bdParam.iteration_wrap > 0 || bdParam.iteration_current > 0)
-        driverStatus |= XAie_DmaSetBdIteration_16(&dmaInst, bdParam.iteration_stepsize, bdParam.iteration_wrap, bdParam.iteration_current);
+        driverStatus |= XAie_DmaSetBdIteration(&dmaInst, bdParam.iteration_stepsize, bdParam.iteration_wrap, bdParam.iteration_current);
     debugMsg(static_cast<std::stringstream &&>(std::stringstream() << "iteration stepsize " << bdParam.iteration_stepsize << ", iteration wrap " << bdParam.iteration_wrap << ", iteration current " << (uint16_t)bdParam.iteration_current).str());
 
     //enable compression
@@ -848,7 +873,7 @@ err_code dma_api::configureBD(int tileType, uint8_t column, uint8_t row, uint16_
     //next bd
     if (bdParam.use_next_bd)
     {
-        driverStatus |= XAie_DmaSetNextBd_16(&dmaInst, bdParam.next_bd, XAIE_ENABLE);
+        driverStatus |= XAie_DmaSetNextBd(&dmaInst, bdParam.next_bd, XAIE_ENABLE);
         debugMsg(static_cast<std::stringstream &&>(std::stringstream() << "next bd " << (uint16_t)bdParam.next_bd).str());
     }
 
@@ -856,7 +881,7 @@ err_code dma_api::configureBD(int tileType, uint8_t column, uint8_t row, uint16_
     driverStatus |= XAie_DmaEnableBd(&dmaInst);
 
     //write bd
-    driverStatus |= XAie_DmaWriteBd_16(config->get_dev(), &dmaInst, tileLoc, bdId);
+    driverStatus |= XAie_DmaWriteBd(config->get_dev(), &dmaInst, tileLoc, bdId);
     debugMsg(static_cast<std::stringstream &&>(std::stringstream() << "XAie_DmaWriteBd " << (uint16_t)bdId << std::endl).str());
 
     // Update status after using AIE driver
@@ -872,7 +897,7 @@ err_code dma_api::enqueueTask(int tileType, uint8_t column, uint8_t row, int dir
     XAie_LocType tileLoc = XAie_TileLoc(column, relativeToAbsoluteRow(config, tileType, row));
 
     //start queue
-    driverStatus |= XAie_DmaChannelSetStartQueue_16(config->get_dev(), tileLoc, channel, (XAie_DmaDirection)dir, startBdId, repeatCount, enableTaskCompleteToken);
+    driverStatus |= XAie_DmaChannelSetStartQueue(config->get_dev(), tileLoc, channel, (XAie_DmaDirection)dir, startBdId, repeatCount, enableTaskCompleteToken);
     debugMsg(static_cast<std::stringstream &&>(std::stringstream() << "XAie_DmaChannelSetStartQueue " << "col " << (uint16_t)tileLoc.Col << ", row " << (uint16_t)tileLoc.Row << ", channel " << (uint16_t)channel << ", dir " << dir
         << ", startBD " << (uint16_t)startBdId << ", repeat count " << repeatCount << ", enable task complete token " << enableTaskCompleteToken << std::endl).str());
 
@@ -904,6 +929,13 @@ err_code dma_api::waitDMAChannelTaskQueue(int tileType, uint8_t column, uint8_t 
     return err_code::ok;
 }
 
+bool dma_api::statusDMAChannelDone(int tileType, uint8_t column, uint8_t row, int dir, uint8_t channel)
+{
+    XAie_LocType tileLoc = XAie_TileLoc(column, relativeToAbsoluteRow(config, tileType, row));
+
+    return XAie_DmaWaitForDone(config->get_dev(), tileLoc, channel, (XAie_DmaDirection)dir, 0) == XAIE_OK;
+}
+
 err_code dma_api::waitDMAChannelDone(int tileType, uint8_t column, uint8_t row, int dir, uint8_t channel)
 {
     int driverStatus = XAIE_OK; //0
@@ -925,7 +957,7 @@ err_code dma_api::updateBDAddressLin(XAie_MemInst* memInst , uint8_t column, uin
   int driverStatus = XAIE_OK;
   XAie_LocType tileLoc = XAie_TileLoc(column, relativeToAbsoluteRow(config, 1, row));
 
-  driverStatus |= XAie_DmaUpdateBdAddrOff_16(memInst, tileLoc ,offset, bdId);
+  driverStatus |= XAie_DmaUpdateBdAddrOff(memInst, tileLoc ,offset, bdId);
 
   if (driverStatus != AieRC::XAIE_OK)
     return errorMsg(err_code::aie_driver_error, "ERROR: adf::dma_api::updateBDAddressLin: AIE driver error.");
@@ -938,7 +970,7 @@ err_code dma_api::updateBDAddress(int tileType, uint8_t column, uint8_t row, uin
   int driverStatus = XAIE_OK; //0
   XAie_LocType tileLoc = XAie_TileLoc(column, relativeToAbsoluteRow(config, tileType, row));
 
-  driverStatus |= XAie_DmaUpdateBdAddr_16(config->get_dev(), tileLoc, address, bdId);
+  driverStatus |= XAie_DmaUpdateBdAddr(config->get_dev(), tileLoc, address, bdId);
   debugMsg(static_cast<std::stringstream &&>(std::stringstream() << "XAie_DmaUpdateBdAddr " << "col " << (uint16_t)tileLoc.Col << ", row " << (uint16_t)tileLoc.Row << ", address " << std::hex << address << std::dec << ", bdId " << bdId << std::endl).str());
 
   if (driverStatus != AieRC::XAIE_OK)
