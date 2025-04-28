@@ -37,7 +37,9 @@
 #include "core/include/experimental/xrt-next.h"
 
 #ifdef XDP_VE2_BUILD
-#include "shim/shim.h"
+#include "core/common/shim/hwctx_handle.h"
+#include "core/common/api/hw_context_int.h"
+#include "shim/xdna_hwctx.h"
 #else
 #include "core/edge/user/shim.h"
 #endif
@@ -46,10 +48,10 @@ namespace {
   static void* fetchAieDevInst(void* devHandle)
   {
 #ifdef XDP_VE2_BUILD
-    auto drv = aiarm::shim::handleCheck(devHandle);
-    if (!drv)
-      return nullptr;
-    auto aieArray = drv->get_aie_array();
+    xrt::hw_context context = xrt_core::hw_context_int::create_hw_context_from_implementation(devHandle);
+    auto hwctx_hdl = static_cast<xrt_core::hwctx_handle*>(context);
+    auto hwctx_obj = dynamic_cast<shim_xdna_edge::xdna_hwctx*>(hwctx_hdl);
+    auto aieArray = hwctx_obj->get_aie_array();
 #else
     auto drv = ZYNQ::shim::handleCheck(devHandle);
     if (!drv)
@@ -116,7 +118,7 @@ namespace xdp {
   /****************************************************************************
    * Gather list of tiles to check status
    ***************************************************************************/
-  void AIEStatusPlugin::getTilesForStatus()
+  void AIEStatusPlugin::getTilesForStatus(void* handle)
   {
     // Capture all tiles across all graphs
     // Note: in the future, we could support user-defined tile sets
@@ -221,7 +223,12 @@ namespace xdp {
       return;
 
     // AIE core register offsets
+#ifdef XDP_VE2_BUILD
+    constexpr uint64_t AIE_OFFSET_CORE_STATUS = 0x38004;
+#else
     constexpr uint64_t AIE_OFFSET_CORE_STATUS = 0x32004;
+#endif
+
     auto offset = metadataReader->getAIETileRowOffset();
     auto hwGen = metadataReader->getHardwareGeneration();
 
@@ -435,13 +442,22 @@ namespace xdp {
     if (!xrt_core::config::get_aie_status())
       return;
 
-    mXrtCoreDevice = xrt_core::get_userpf_device(handle);
-
-    uint64_t deviceID = db->addDevice(util::getDebugIpLayoutPath(handle)); // Get the unique device Id
+    #ifdef XDP_VE2_BUILD
+      xrt::hw_context context = xrt_core::hw_context_int::create_hw_context_from_implementation(handle);
+      mXrtCoreDevice = xrt_core::hw_context_int::get_core_device(context);
+      uint64_t deviceID = db->addDevice("ve2_device");
+    #else
+      mXrtCoreDevice = xrt_core::get_userpf_device(handle);
+      uint64_t deviceID = db->addDevice(util::getDebugIpLayoutPath(handle)); // Get the unique device Id
+    #endif
 
     if (!(db->getStaticInfo()).isDeviceReady(deviceID)) {
       // Update the static database with information from xclbin
-      (db->getStaticInfo()).updateDevice(deviceID, nullptr, handle);
+      #ifdef XDP_VE2_BUILD
+      (db->getStaticInfo()).updateDeviceFromCoreDevice(deviceID, mXrtCoreDevice);
+      #else
+        (db->getStaticInfo()).updateDeviceFromHandle(deviceID, nullptr, handle);
+      #endif
     }
 
     // Grab AIE metadata
@@ -451,10 +467,14 @@ namespace xdp {
     auto hwGen =  metadataReader->getHardwareGeneration();
 
     // Update list of tiles to debug
-    getTilesForStatus();
+    getTilesForStatus(handle);
 
     // Open the writer for this device
-    std::string devicename = util::getDeviceName(handle);
+    #ifdef XDP_VE2_BUILD
+      std::string devicename = util::getDeviceName(handle,true);
+    #else
+      std::string devicename = util::getDeviceName(handle);
+    #endif
 
     std::string currentTime = "0000_00_00_0000";
     auto time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());

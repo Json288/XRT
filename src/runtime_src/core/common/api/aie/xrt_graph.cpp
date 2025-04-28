@@ -126,7 +126,6 @@ class profiling_impl
 {
 private:
   std::unique_ptr<xrt_core::profile_handle> m_profile_handle{nullptr};
-  bool is_stopped{false};
 
 public:
   static constexpr int invalid_handle = -1;
@@ -171,10 +170,7 @@ public:
   void
   stop()
   {
-    if(is_stopped == false)
       m_profile_handle->stop();
-
-    is_stopped = true;
   }
 };
 
@@ -214,6 +210,12 @@ public:
   async(std::vector<xrt::bo>& bos, xclBOSyncDirection dir, size_t size, size_t offset) const
   {
     m_buffer_handle->async(bos, dir, size, offset);
+  }
+
+  device::buffer_state
+  async_status() const
+  {
+    return m_buffer_handle->async_status();
   }
 
   void
@@ -512,6 +514,13 @@ async(xrt::bo ping, xrt::bo pong, xclBOSyncDirection dir, size_t size, size_t of
 {
   std::vector<xrt::bo> bos {std::move(ping),std::move(pong)};
   return get_handle()->async(bos, dir, size, offset);
+}
+
+device::buffer_state
+buffer::
+async_status() const
+{
+  return get_handle()->async_status();
 }
 
 void

@@ -120,6 +120,9 @@ zocl_aie_error_cb(void *arg)
 	struct aie_errors *errors;
 	int i;
 
+	DRM_WARN("%s: Received AIE_ERR callback, ignoring it\n", __func__);
+	return;
+
 	if (!slot) {
 		DRM_ERROR("%s: slot is not initialized\n", __func__);
 		return;
@@ -376,7 +379,7 @@ zocl_aie_slot_reset(struct drm_zocl_slot* slot)
 
 }
 
-static void
+void
 zocl_destroy_aie(struct drm_zocl_slot* slot)
 {
 	if (!slot->aie_information)
@@ -409,7 +412,7 @@ zocl_cleanup_aie(struct drm_zocl_slot *slot)
 	if (!slot)
 	{
 		DRM_ERROR("%s: Invalid slot", __func__);
-		return 0;
+		return -EINVAL;
 	}
 
 	int ret = 0;
